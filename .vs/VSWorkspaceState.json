@@ -1,0 +1,14 @@
+{
+  "ExpandedNodes": [
+    "",
+    "\\conf",
+    "\\conf\\dset",
+    "\\dataset",
+    "\\dataset\\debug",
+    "\\dataset\\debug\\clean",
+    "\\dataset\\debug\\noisy",
+    "\\denoiser"
+  ],
+  "SelectedNode": "\\denoiser\\custom.py",
+  "PreviewInSolutionExplorer": false
+}
