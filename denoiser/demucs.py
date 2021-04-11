@@ -153,7 +153,7 @@ class Demucs(keras.Model):
 
         # Upsample
         if self.upsample:
-            self.upsample(x)
+            x = self.upsample(x)
 
         # Encode
         skips = deque()
@@ -171,7 +171,7 @@ class Demucs(keras.Model):
 
         # Downsample
         if self.downsample:
-            self.downsample(x)
+            x = self.downsample(x)
 
         # Denormalize
         if self.normalize:
