@@ -10,7 +10,9 @@ import logging
 import os
 import re
 
-from .audio import Audioset
+import tensorflow as tf
+import tensorflow_io as tfio
+from tensorflow.data import Dataset
 
 logger = logging.getLogger(__name__)
 
@@ -66,34 +68,83 @@ def match_files(noisy, clean, matching="sort"):
         raise ValueError(f"Invalid value for matching {matching}")
 
 
-class NoisyCleanSet:
-    def __init__(self, json_dir, matching="sort", length=None, stride=None,
-                 pad=True, sample_rate=None):
-        """__init__.
+def load_files(json_dir, matching="sort"):
+    noisy_json = os.path.join(json_dir, 'noisy.json')
+    clean_json = os.path.join(json_dir, 'clean.json')
+    with open(noisy_json, 'r') as f:
+        noisy = json.load(f)
+    with open(clean_json, 'r') as f:
+        clean = json.load(f)
 
-        :param json_dir: directory containing both clean.json and noisy.json
-        :param matching: matching function for the files
-        :param length: maximum sequence length
-        :param stride: the stride used for splitting audio sequences
-        :param pad: pad the end of the sequence with zeros
-        :param sample_rate: the signals sampling rate
-        """
-        noisy_json = os.path.join(json_dir, 'noisy.json')
-        clean_json = os.path.join(json_dir, 'clean.json')
-        with open(noisy_json, 'r') as f:
-            noisy = json.load(f)
-        with open(clean_json, 'r') as f:
-            clean = json.load(f)
+    match_files(noisy, clean, matching)
+    sources = (noisy, clean)
+    source_paths = tuple([path for path, size in source] for source in sources)
+    files_ds = Dataset.from_tensor_slices(source_paths)
+    return files_ds
 
-        match_files(noisy, clean, matching)
-        kw = {'length': length, 'stride': stride, 'pad': pad, 'sample_rate': sample_rate}
-        self.clean_set = Audioset(clean, **kw)
-        self.noisy_set = Audioset(noisy, **kw)
 
-        assert len(self.clean_set) == len(self.noisy_set)
+def apply(func):
+    def apply_all(*sources):
+        if len(sources)==1: return func(sources[0])
+        res = tuple(func(*source) if isinstance(source, tuple) else func(source) for source in sources)
+        if all(isinstance(r, Dataset) for r in res):
+            res = Dataset.zip(res)
+        return res
+    return apply_all
 
-    def __getitem__(self, index):
-        return self.noisy_set[index], self.clean_set[index]
 
-    def __len__(self):
-        return len(self.noisy_set)
+def read_audio(file_path):
+    audio = tfio.audio.AudioIOTensor(file_path,dtype='int16').to_tensor()
+    return tf.cast(audio, tf.float32) / (2**16/2)
+
+
+def generate_audio(file_ds):
+    return file_ds.map(apply(read_audio))
+
+
+def extract_examples(audio, length, stride):
+    indices = Dataset.range(0,tf.cast(tf.shape(audio)[0]-length+1,dtype='int64'),stride)
+    return indices.map(lambda i: audio[i:i+length,...])
+
+
+def extract_examples_static(audio, length, stride):
+    "Same as `extract_examples`, except returns `tf.Tensor` instead of `Dataset`"
+    indices = (tf.range(length) + tf.range(0,tf.maximum(0,tf.shape(audio)[0]-length+1),stride)[:,tf.newaxis])
+    return tf.gather_nd(audio, indices[...,tf.newaxis])
+
+
+def generate_examples(audio_ds, length, stride, batch=None):
+    func = lambda audio: extract_examples(audio, length, stride)
+    examples_ds = audio_ds.flat_map(apply(func))
+    if batch:
+        examples_ds = examples_ds.batch(batch)
+    return examples_ds
+
+
+def generate_samples(audio_ds, batch=None):
+    func = lambda t: (t,tf.shape(t)[0])
+    audio_length_ds = audio_ds.map(apply(func))
+    if batch:
+        audio_length_ds = audio_length_ds.padded_batch(batch)
+    return audio_length_ds
+
+
+def generate_dataset(files_ds, example_length, example_stride, batch=None, shuffle=True):
+    if shuffle:
+        # Shuffle all file paths, reshuffling enabled
+        # This prevents training on local pockets of the same speaker
+        files_ds = files_ds.shuffle(len(files_ds))
+    audio_ds = generate_audio(files_ds)
+
+    def func_examples(audio):
+        return extract_examples_static(audio, example_length, example_stride)
+    def func_sample(t):
+        return (t,tf.shape(t)[0])
+    def flatten(t):
+        return tf.reshape(t, tf.concat([[tf.shape(t)[0] * tf.shape(t)[1]], tf.shape(t)[2:]], axis=0))
+
+    combined_ds = audio_ds.map(apply(lambda audio: (func_examples(audio), func_sample(audio))))
+    if batch:
+        combined_ds = combined_ds.padded_batch(batch) \
+                                 .map(apply(lambda e,s: (flatten(e), s)))
+    return combined_ds
