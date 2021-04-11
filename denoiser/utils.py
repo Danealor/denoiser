@@ -10,6 +10,7 @@ import logging
 from contextlib import contextmanager
 import inspect
 import time
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +23,8 @@ def capture_init(init):
     """
     @functools.wraps(init)
     def __init__(self, *args, **kwargs):
-        self._init_args_kwargs = (args, kwargs)
         init(self, *args, **kwargs)
+        self._init_args_kwargs = (args, kwargs)
 
     return __init__
 
@@ -163,3 +164,42 @@ def bold(text):
     Display text in bold in the terminal.
     """
     return colorize(text, "1")
+
+
+class LengthCalc:
+    def __init__(self, depth, kernel_size, stride):
+        self.first = LengthCalc.calc_in(1, depth, kernel_size, stride)
+        self.diff = stride**depth
+
+    @staticmethod
+    def calc_out(input, depth, kernel_size, stride):
+        x = input
+        n = depth
+        k = kernel_size
+        s = stride
+
+        return (x + s*(1-s**n)//(1-s)*(1-k//s))/(s**n)
+    
+    @staticmethod
+    def calc_in(output, depth, kernel_size, stride):
+        x = output
+        n = depth
+        k = kernel_size
+        s = stride
+
+        return s**n*x - s*(1-s**n)//(1-s)*(1-k//s)
+
+    def first_lower(self, input):
+        output = (input - self.first) // self.diff
+        try:
+            if output < 0: return 0
+            return output*self.diff + self.first
+        except:
+            return np.where(output < 0, np.zeros_like(output), output*self.diff + self.first)
+
+    def first_greater(self, input):
+        output = (input - self.first - 1) // self.diff + 1
+        try:
+            return max(0,output)*self.diff + self.first
+        except:
+            return np.where(output < 0, np.zeros_like(output), output)*self.diff + self.first
