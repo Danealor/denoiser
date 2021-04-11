@@ -90,11 +90,12 @@ class Normalize(layers.Layer):
     def call(self, inputs):
         mono = tf.math.reduce_mean(inputs, axis=1)
         std = tf.math.reduce_std(mono, axis=-1)
-        return self.floor + std
+        std += self.floor
+        std_unsqueezed = std[...,tf.newaxis,tf.newaxis]
+        return inputs / std_unsqueezed, std_unsqueezed
 
     def norm_denorm(self, x):
-        std = self(x)
-        norm = x / std
+        norm, std = self(x)
         def denorm(x):
             return x * std
         return norm, denorm
