@@ -60,6 +60,7 @@ class Demucs(keras.Model):
                  rescale=0.1,
                  floor=1e-3,
                  name='demucs',
+                 streaming=False,
                  **kwargs):
 
         super().__init__(name=name, **kwargs)
@@ -75,6 +76,7 @@ class Demucs(keras.Model):
         self.stride = stride
         self.causal = causal
         self.resample = resample
+        self.streaming = streaming
         self.length_calc = LengthCalc(depth, kernel_size, stride)
 
         if resample == 2:
@@ -124,9 +126,9 @@ class Demucs(keras.Model):
             chin = hidden
             hidden = min(int(growth * hidden), max_hidden)
 
-        self.lstm = BLSTM(bi=not causal)
+        self.lstm = BLSTM(bi=not causal, stateful=streaming)
 
-    def valid_length(self, length):
+    def valid_length(self, length, greater=True):
         """
         Return the nearest valid length to use with the model so that
         there is no time steps left over in a convolutions, e.g. for all
@@ -135,14 +137,17 @@ class Demucs(keras.Model):
         If the mixture has a valid length, the estimated sources
         will have exactly the same length.
         """
-        return self.length_calc.first_greater(length*self.resample)//self.resample
+        if greater:
+            return self.length_calc.first_greater(length*self.resample)//self.resample
+        else:
+            return self.length_calc.first_lower(length*self.resample)//self.resample
 
     @property
     def total_stride(self):
         return self.stride ** self.depth // self.resample
 
-    def set_live(self, live):
-        self.blstm.set_live(live)
+    def build(self):
+        super().build((1 if self.streaming else None, None, self.chin))
 
     def call(self, inputs):
         x = inputs
