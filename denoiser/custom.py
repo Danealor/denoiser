@@ -1,23 +1,25 @@
 import tensorflow as tf
-from tensorflow.keras import layers
+from tensorflow.keras import layers, losses
 
 class BLSTM(layers.Layer):
-    def __init__(self, num_layers=2, bi=True, **kwargs):
+    def __init__(self, num_layers=2, bi=True, stateful=False, **kwargs):
         super().__init__(**kwargs)
         self.num_layers = num_layers
         self.bidirectional = bi
+        self.stateful = stateful
 
     def get_config(self):
         config = super().get_config()
         config.update({"num_layers": self.num_layers})
         config.update({"bidirectional": self.bidirectional})
+        config.update({"stateful": self.stateful})
         return config
 
     # This might be more efficient if implemented using cudNN LSTM
     def _stacked_lstm_impl1(self, dim):
         lstm_layers = []
         for layer in range(self.num_layers):
-            lstm = layers.LSTM(dim, return_sequences=True)
+            lstm = layers.LSTM(dim, return_sequences=True, stateful=self.stateful)
             if self.bidirectional:
                 lstm = layers.Bidirectional(lstm)
             lstm_layers.append(lstm)
@@ -26,7 +28,7 @@ class BLSTM(layers.Layer):
     def _stacked_lstm_impl2(self, dim):
         rnn_cells = [layers.LSTMCell(dim) for _ in range(self.num_layers)]
         stacked_lstm = layers.StackedRNNCells(rnn_cells)
-        lstm_layer = layers.RNN(stacked_lstm, return_sequences=True)
+        lstm_layer = layers.RNN(stacked_lstm, return_sequences=True, stateful=self.stateful)
         if self.bidirectional:
             lstm_layer = layers.Bidirectional(lstm_layer)
         return [lstm_layer]
@@ -36,10 +38,6 @@ class BLSTM(layers.Layer):
         self.lstm_layers = self._stacked_lstm_impl1(dim)
         if self.bidirectional:
             self.linear = layers.Dense(dim)
-
-    def set_live(self, live):
-        for lstm_layer in self.lstm_layers:
-            lstm_layer.stateful = live
 
     def call(self, inputs):
         x = inputs
@@ -99,3 +97,12 @@ class Normalize(layers.Layer):
         def denorm(x):
             return x * std
         return norm, denorm
+
+
+class SumLoss(losses.Loss):
+    def __init__(self, *losses, **kwargs):
+        super().__init__(**kwargs)
+        self.losses = losses
+
+    def call(self, y_true, y_pred):
+        return sum(loss(y_true, y_pred) for loss in self.losses)

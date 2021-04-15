@@ -11,6 +11,7 @@ from contextlib import contextmanager
 import inspect
 import time
 import numpy as np
+import tensorflow as tf
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +167,22 @@ def bold(text):
     return colorize(text, "1")
 
 
+def get_device():
+    gpus = tf.config.list_logical_devices('GPU')
+    if gpus:
+        return gpus[0]
+    return tf.config.list_logical_devices()[0]
+
+
+def map_cond(func, *elements):
+    return tuple(func(x) if x is not None else None for x in elements)
+
+
+@tf.function
+def tensor_to_tuple(tensor, num_elements):
+    return tuple(tensor[i] for i in range(num_elements))
+
+
 class LengthCalc:
     def __init__(self, depth, kernel_size, stride):
         self.first = LengthCalc.calc_in(1, depth, kernel_size, stride)
@@ -191,15 +208,19 @@ class LengthCalc:
 
     def first_lower(self, input):
         output = (input - self.first) // self.diff
-        try:
+        if isinstance(output, tf.Tensor):
+            return tf.where(output < 0, tf.zeros_like(output), output*self.diff + self.first)
+        elif isinstance(output, np.ndarray):
+            return np.where(output < 0, np.zeros_like(output), output*self.diff + self.first)
+        else:
             if output < 0: return 0
             return output*self.diff + self.first
-        except:
-            return np.where(output < 0, np.zeros_like(output), output*self.diff + self.first)
 
     def first_greater(self, input):
         output = (input - self.first - 1) // self.diff + 1
-        try:
-            return max(0,output)*self.diff + self.first
-        except:
+        if isinstance(output, tf.Tensor):
+            return tf.where(output < 0, tf.zeros_like(output), output)*self.diff + self.first
+        elif isinstance(output, np.ndarray):
             return np.where(output < 0, np.zeros_like(output), output)*self.diff + self.first
+        else:
+            return max(0,output)*self.diff + self.first

@@ -11,223 +11,253 @@ from pathlib import Path
 import os
 import time
 
-import torch
-import torch.nn.functional as F
+import tensorflow as tf
 
-from . import augment, distrib, pretrained
-from .enhance import enhance
-from .evaluate import evaluate
-from .stft_loss import MultiResolutionSTFTLoss
-from .utils import bold, copy_state, pull_metric, serialize_model, swap_state, LogProgress
+from . import augment
+from .custom import SumLoss
+from .metrics import PESQ, STOI
+from .stft_loss import TotalMultiResolutionSTFTLoss
+from .utils import map_cond, tensor_to_tuple
 
 logger = logging.getLogger(__name__)
 
 
-class Solver(object):
-    def __init__(self, data, model, optimizer, args):
-        self.tr_loader = data['tr_loader']
-        self.cv_loader = data['cv_loader']
-        self.tt_loader = data['tt_loader']
+class Solver(tf.keras.Model):
+    def __init__(self, model, args):
+        super().__init__()
+
         self.model = model
-        self.dmodel = distrib.wrap(model)
-        self.optimizer = optimizer
+        self.args = args
 
         # data augment
-        augments = []
         if args.remix:
-            augments.append(augment.Remix())
+            self.remix = augment.Remix()
         if args.bandmask:
-            augments.append(augment.BandMask(args.bandmask, sample_rate=args.sample_rate))
+            self.bandmask = augment.BandMask(args.bandmask, sample_rate=args.sample_rate)
         if args.shift:
-            augments.append(augment.Shift(args.shift, args.shift_same))
+            self.shift = augment.Shift(args.shift, args.shift_same)
         if args.revecho:
-            augments.append(
-                augment.RevEcho(args.revecho))
-        self.augment = torch.nn.Sequential(*augments)
-
-        # Training config
-        self.device = args.device
-        self.epochs = args.epochs
-
-        # Checkpoints
-        self.continue_from = args.continue_from
-        self.eval_every = args.eval_every
-        self.checkpoint = args.checkpoint
-        if self.checkpoint:
-            self.checkpoint_file = Path(args.checkpoint_file)
-            self.best_file = Path(args.best_file)
-            logger.debug("Checkpoint will be saved to %s", self.checkpoint_file.resolve())
-        self.history_file = args.history_file
-
-        self.best_state = None
-        self.restart = args.restart
-        self.history = []  # Keep track of loss
-        self.samples_dir = args.samples_dir  # Where to save samples
-        self.num_prints = args.num_prints  # Number of times to log per epoch
-        self.args = args
-        self.mrstftloss = MultiResolutionSTFTLoss(factor_sc=args.stft_sc_factor,
-                                                  factor_mag=args.stft_mag_factor).to(self.device)
-        self._reset()
-
-    def _serialize(self):
-        package = {}
-        package['model'] = serialize_model(self.model)
-        package['optimizer'] = self.optimizer.state_dict()
-        package['history'] = self.history
-        package['best_state'] = self.best_state
-        package['args'] = self.args
-        tmp_path = str(self.checkpoint_file) + ".tmp"
-        torch.save(package, tmp_path)
-        # renaming is sort of atomic on UNIX (not really true on NFS)
-        # but still less chances of leaving a half written checkpoint behind.
-        os.rename(tmp_path, self.checkpoint_file)
-
-        # Saving only the latest best model.
-        model = package['model']
-        model['state'] = self.best_state
-        tmp_path = str(self.best_file) + ".tmp"
-        torch.save(model, tmp_path)
-        os.rename(tmp_path, self.best_file)
+            self.revecho = augment.RevEcho(args.revecho)
 
     def _reset(self):
         """_reset."""
         load_from = None
         load_best = False
         keep_history = True
+
+        args = self.args
+
         # Reset
-        if self.checkpoint and self.checkpoint_file.exists() and not self.restart:
-            load_from = self.checkpoint_file
-        elif self.continue_from:
-            load_from = self.continue_from
-            load_best = self.args.continue_best
+        checkpoint_file = Path(args.checkpoint_file)
+        continue_from = Path(args.continue_from)
+
+        if args.checkpoint and checkpoint_file.exists() and not args.restart:
+            load_from = args.checkpoint_file
+        elif args.continue_from:
+            load_from = args.continue_from
+            load_best = args.continue_best
             keep_history = False
 
         if load_from:
             logger.info(f'Loading checkpoint model: {load_from}')
-            package = torch.load(load_from, 'cpu')
-            if load_best:
-                self.model.load_state_dict(package['best_state'])
+            self.load_weights(load_from)
+
+    def compile_from_args(self):
+        args = self.args
+
+        def make_loss():
+            # Configure model loss
+            if args.loss == 'l1':
+                loss = tf.keras.losses.MeanAbsoluteError(reduction=tf.keras.losses.Reduction.SUM)
+            elif args.loss == 'l2':
+                loss = tf.keras.losses.MeanSquaredError(reduction=tf.keras.losses.Reduction.SUM)
+            elif args.loss == 'huber':
+                loss = tf.keras.losses.Huber(reduction=tf.keras.losses.Reduction.SUM)
             else:
-                self.model.load_state_dict(package['model']['state'])
-            if 'optimizer' in package and not load_best:
-                self.optimizer.load_state_dict(package['optimizer'])
-            if keep_history:
-                self.history = package['history']
-            self.best_state = package['best_state']
-        continue_pretrained = self.args.continue_pretrained
-        if continue_pretrained:
-            logger.info("Fine tuning from pre-trained model %s", continue_pretrained)
-            model = getattr(pretrained, self.args.continue_pretrained)()
-            self.model.load_state_dict(model.state_dict())
+                raise ValueError(f"Invalid loss {args.loss}")
 
-    def train(self):
-        # Optimizing the model
-        if self.history:
-            logger.info("Replaying metrics from previous run")
-        for epoch, metrics in enumerate(self.history):
-            info = " ".join(f"{k.capitalize()}={v:.5f}" for k, v in metrics.items())
-            logger.info(f"Epoch {epoch + 1}: {info}")
+            # MultiResolution STFT loss
+            if args.stft_loss:
+                mrstftloss = TotalMultiResolutionSTFTLoss(factor_sc=args.stft_sc_factor,
+                                                          factor_mag=args.stft_mag_factor,
+                                                          reduction=losses.Reduction.SUM)
+                loss = SumLoss(loss, mrstftloss, reduction=losses.Reduction.SUM)
 
-        for epoch in range(len(self.history), self.epochs):
-            # Train one epoch
-            self.model.train()
-            start = time.time()
-            logger.info('-' * 70)
-            logger.info("Training...")
-            train_loss = self._run_one_epoch(epoch)
-            logger.info(
-                bold(f'Train Summary | End of Epoch {epoch + 1} | '
-                     f'Time {time.time() - start:.2f}s | Train Loss {train_loss:.5f}'))
+            return loss
 
-            if self.cv_loader:
-                # Cross validation
-                logger.info('-' * 70)
-                logger.info('Cross validation...')
-                self.model.eval()
-                with torch.no_grad():
-                    valid_loss = self._run_one_epoch(epoch, cross_valid=True)
-                logger.info(
-                    bold(f'Valid Summary | End of Epoch {epoch + 1} | '
-                         f'Time {time.time() - start:.2f}s | Valid Loss {valid_loss:.5f}'))
+        # Duplicate loss for double elements
+        loss = [make_loss(), make_loss()]
+
+        # Configure model optimizer
+        if args.optim == "adam":
+            optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr, beta_1=0.9, beta_2=args.beta2)
+        else:
+            raise ValueError(f"Invalid optimizer {args.optimizer}")
+
+        # Configure metrics
+        metrics = []
+        if args.pesq:
+            metrics.append(PESQ(sample_rate=args.sample_rate))
+        metrics.append(STOI(sample_rate=args.sample_rate))
+
+        self.compile(optimizer, loss, metrics)
+
+    def fit_from_args(self, data):
+        tr_loader = data['tr_loader']
+        cv_loader = data['cv_loader']
+        tt_loader = data['tt_loader']
+
+        args = self.args
+
+        # Checkpoints
+        self._reset()
+
+        # Callbacks
+        callbacks = []
+        if args.checkpoint:
+            callbacks.append(tf.keras.callbacks.ModelCheckpoint(Path(args.checkpoint_file)))
+            callbacks.append(tf.keras.callbacks.ModelCheckpoint(Path(args.best_file), save_best_only=True))
+
+        self.fit(x=tr_loader, 
+                 validation_data=tt_loader, 
+                 epochs=args.epochs, 
+                 validation_freq=args.eval_every,
+                 callbacks=callbacks)
+
+    def _extract_and_pack(self, sources):
+        examples = []
+        samples = []
+        sample_lengths = []
+        for source in sources:
+            e, s = source.get('examples'), source.get('samples')
+            if e is not None: 
+                examples.append(e)
+            if s is not None: 
+                sample, length = s
+                samples.append(sample)
+                sample_lengths.append(length)
+        
+        return map_cond(tf.stack, examples, samples, sample_lengths)
+
+    def _preprocess(self, examples, samples, sample_lengths):
+        def split(sources):
+            noisy, clean = tensor_to_tuple(sources, 2)
+            noise = noisy - clean
+            return tf.stack([noise, clean])
+
+        def combine(sources):
+            noise, clean = tensor_to_tuple(sources, 2)
+            noisy = clean + noise
+            return tf.stack([noisy, clean])
+
+        # Split noisy into noise and clean
+        examples, samples = map_cond(split, examples, samples)
+
+        if self.args.remix:
+            if examples:
+                examples = self.remix(examples)
+            if samples:
+                samples, sample_lengths = self.remix((samples, sample_lengths), grouped=True)
+
+        if self.args.bandmask:
+            examples, samples = map_cond(self.bandmask, examples, samples)
+
+        if self.args.shift:
+            if examples:
+                examples, _ = self.shift(examples)
+            if samples:
+                samples, offsets = self.shift(samples)
+                sample_lengths -= offsets
+
+        if self.args.revecho:
+            examples, samples = map_cond(self.revecho, examples, samples)
+
+        # Combine noise and clean back into noisy
+        examples, samples = map_cond(combine, examples, samples)
+
+        return examples, samples, sample_lengths
+
+    def _postprocess(self, examples, samples, sample_lengths):
+        if samples is not None:
+            sources, batch, length, channels = tensor_to_tuple(tf.shape(samples), 4)
+
+            # Truncate to shortest sample, in case of shuffling/shifting
+            sample_lengths = tf.math.reduce_min(sample_lengths, axis=0)
+            # Truncate further down to nearest valid length
+            if hasattr(self.model, 'valid_length'):
+                sample_lengths = self.model.valid_length(sample_lengths, greater=False)
+
+            # Convert to Ragged Tensor, with ragged dimension on length axis (axis=2)
+            sample_lengths = tf.tile(sample_lengths, (sources,))
+            samples = tf.reshape(samples, (sources * batch, length, channels))
+            samples = tf.RaggedTensor.from_tensor(samples, sample_lengths)
+            samples = tf.RaggedTensor.from_uniform_row_length(samples, tf.cast(batch, tf.int64))
+
+        return examples, samples
+
+    def _execute(self, sources, training=False):
+        noisy, clean = tensor_to_tuple(sources, 2)
+        estimate = self.model(noisy, training=True)
+        return tf.stack([clean, estimate]) # swap to the (y_true, y_pred) order
+
+    @staticmethod
+    def _unpack(*elements):
+        y_true = []
+        y_pred = []
+        for elem in elements:
+            if elem is not None:
+                y_true.append(elem[0])
+                y_pred.append(elem[1])
             else:
-                valid_loss = 0
+                y_true.append(None)
+                y_pred.append(None)
+        return y_true, y_pred
 
-            best_loss = min(pull_metric(self.history, 'valid') + [valid_loss])
-            metrics = {'train': train_loss, 'valid': valid_loss, 'best': best_loss}
-            # Save the best model
-            if valid_loss == best_loss:
-                logger.info(bold('New best valid loss %.4f'), valid_loss)
-                self.best_state = copy_state(self.model.state_dict())
+    def train_step(self, inputs):
+        examples, samples, sample_lengths = self._extract_and_pack(inputs)
+        examples, samples, sample_lengths = self._preprocess(examples, samples, sample_lengths)
 
-            # evaluate and enhance samples every 'eval_every' argument number of epochs
-            # also evaluate on last epoch
-            if (epoch + 1) % self.eval_every == 0 or epoch == self.epochs - 1 and self.tt_loader:
-                # Evaluate on the testset
-                logger.info('-' * 70)
-                logger.info('Evaluating on the test set...')
-                # We switch to the best known model for testing
-                with swap_state(self.model, self.best_state):
-                    pesq, stoi = evaluate(self.args, self.model, self.tt_loader)
+        # Execute in model
+        with tf.GradientTape():
+            examples, samples = map_cond(lambda sources: 
+                self._execute(sources, training=True), examples, samples)
+            examples, samples = self._postprocess(examples, samples, sample_lengths)
+            loss = self.compiled_loss(*self._unpack(examples, samples))
+            total_loss = sum(loss for loss in (example_loss, sample_loss) if loss is not None)
 
-                metrics.update({'pesq': pesq, 'stoi': stoi})
+        # Compute gradients
+        trainable_vars = self.trainable_variables
+        gradients = tape.gradient(total_loss, trainable_vars)
 
-                # enhance some samples
-                logger.info('Enhance and save samples...')
-                enhance(self.args, self.model, self.samples_dir)
+        # Update weights
+        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
 
-            self.history.append(metrics)
-            info = " | ".join(f"{k.capitalize()} {v:.5f}" for k, v in metrics.items())
-            logger.info('-' * 70)
-            logger.info(bold(f"Overall Summary | Epoch {epoch + 1} | {info}"))
+        # No metrics are computed in the train step except for loss.
+        return {'loss': total_loss}
 
-            if distrib.rank == 0:
-                json.dump(self.history, open(self.history_file, "w"), indent=2)
-                # Save model each epoch
-                if self.checkpoint:
-                    self._serialize()
-                    logger.debug("Checkpoint saved to %s", self.checkpoint_file.resolve())
+    def test_step(self, inputs):
+        examples, samples, sample_lengths = self._extract_and_pack(inputs)
+        examples, samples, sample_lengths = self._preprocess(examples, samples, sample_lengths)
+        
+        # Execute in model
+        examples, samples = map_cond(lambda sources: self._execute(sources, training=False), examples, samples)
+        examples, samples = self._postprocess(examples, samples, sample_lengths)
+        example_loss, sample_loss = map_cond(lambda sources: self.compiled_loss(*sources), examples, samples)
+        total_loss = sum(loss for loss in (example_loss, sample_loss) if loss is not None)
 
-    def _run_one_epoch(self, epoch, cross_valid=False):
-        total_loss = 0
-        data_loader = self.tr_loader if not cross_valid else self.cv_loader
+        # Update the metrics.
+        map_cond(lambda sources: self.compiled_metrics.update_state(*sources), examples, samples)
 
-        # get a different order for distributed training, otherwise this will get ignored
-        data_loader.epoch = epoch
+        # Return a dict mapping metric names to current value.
+        # Note that it will include the loss (tracked in self.metrics).
+        return {'loss': total_loss} + {m.name: m.result() for m in self.metrics}
 
-        label = ["Train", "Valid"][cross_valid]
-        name = label + f" | Epoch {epoch + 1}"
-        logprog = LogProgress(logger, data_loader, updates=self.num_prints, name=name)
-        for i, data in enumerate(logprog):
-            noisy, clean = [x.to(self.device) for x in data]
-            if not cross_valid:
-                sources = torch.stack([noisy - clean, clean])
-                sources = self.augment(sources)
-                noise, clean = sources
-                noisy = noise + clean
-            estimate = self.dmodel(noisy)
-            # apply a loss function after each layer
-            with torch.autograd.set_detect_anomaly(True):
-                if self.args.loss == 'l1':
-                    loss = F.l1_loss(clean, estimate)
-                elif self.args.loss == 'l2':
-                    loss = F.mse_loss(clean, estimate)
-                elif self.args.loss == 'huber':
-                    loss = F.smooth_l1_loss(clean, estimate)
-                else:
-                    raise ValueError(f"Invalid loss {self.args.loss}")
-                # MultiResolution STFT loss
-                if self.args.stft_loss:
-                    sc_loss, mag_loss = self.mrstftloss(estimate.squeeze(1), clean.squeeze(1))
-                    loss += sc_loss + mag_loss
+    def predict_step(self, inputs):
+        examples, samples, sample_lengths = self._extract_and_pack(inputs)
+        examples, samples, sample_lengths = self._preprocess(examples, samples, sample_lengths)
+        
+        # Execute in model
+        examples, samples = map_cond(self.model, examples, samples)
+        examples, samples = self._postprocess(examples, samples, sample_lengths)
 
-                # optimize model in training mode
-                if not cross_valid:
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    self.optimizer.step()
-
-            total_loss += loss.item()
-            logprog.update(loss=format(total_loss / (i + 1), ".5f"))
-            # Just in case, clear some memory
-            del loss, estimate
-        return distrib.average([total_loss / (i + 1)], i + 1)[0]
+        return tuple(s for s in (examples, samples) if s)

@@ -98,8 +98,12 @@ def read_audio(file_path):
     return tf.cast(audio, tf.float32) / (2**16/2)
 
 
-def generate_audio(file_ds):
-    return file_ds.map(apply(read_audio))
+def generate_audio(files_ds, shuffle=False):
+    if shuffle:
+        # Shuffle all file paths, reshuffling enabled
+        # This prevents training on local pockets of the same speaker
+        files_ds = files_ds.shuffle(len(files_ds))
+    return files_ds.map(apply(read_audio))
 
 
 def extract_examples(audio, length, stride):
@@ -110,7 +114,7 @@ def extract_examples(audio, length, stride):
 def extract_examples_static(audio, length, stride):
     "Same as `extract_examples`, except returns `tf.Tensor` instead of `Dataset`"
     indices = (tf.range(length) + tf.range(0,tf.maximum(0,tf.shape(audio)[0]-length+1),stride)[:,tf.newaxis])
-    return tf.gather_nd(audio, indices[...,tf.newaxis])
+    return tf.gather(audio, indices)
 
 
 def generate_examples(audio_ds, length, stride, batch=None):
@@ -129,13 +133,7 @@ def generate_samples(audio_ds, batch=None):
     return audio_length_ds
 
 
-def generate_dataset(files_ds, example_length, example_stride, batch=None, shuffle=True):
-    if shuffle:
-        # Shuffle all file paths, reshuffling enabled
-        # This prevents training on local pockets of the same speaker
-        files_ds = files_ds.shuffle(len(files_ds))
-    audio_ds = generate_audio(files_ds)
-
+def generate_both(audio_ds, example_length, example_stride, batch=None):
     def func_examples(audio):
         return extract_examples_static(audio, example_length, example_stride)
     def func_sample(t):
@@ -148,3 +146,19 @@ def generate_dataset(files_ds, example_length, example_stride, batch=None, shuff
         combined_ds = combined_ds.padded_batch(batch) \
                                  .map(apply(lambda e,s: (flatten(e), s)))
     return combined_ds
+
+def generate_dataset(json_dir, length, stride, batch_size, matching='sort', element_type='both', named=True):
+    files_ds = load_files(json_dir, matching)
+    audio_ds = generate_audio(files_ds, shuffle=True)
+    if element_type == 'examples':
+        return generate_examples(audio_ds, length, stride, batch_size)\
+                 .map(apply(lambda e: dict(examples=e)))
+    elif element_type == 'samples':
+        return generate_samples(audio_ds, batch_size)\
+                 .map(apply(lambda s: dict(samples=s)))
+    elif element_type == 'both':
+        return generate_both(audio_ds, length, stride, batch_size)\
+                 .map(apply(lambda e,s: dict(examples=e, samples=s)))
+    else:
+        raise ValueError(f"element_type must be one of 'examples', 'samples', or 'both';" +
+                         f" instead found '{element_type}'")
