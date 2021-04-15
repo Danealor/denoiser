@@ -5,28 +5,32 @@
 # LICENSE file in the root directory of this source tree.
 # author: adefossez
 
-import random
-import torch as th
-from torch import nn
-from torch.nn import functional as F
+import tensorflow as tf
+from tensorflow.keras import layers
 
 from . import dsp
 
 
-class Remix(nn.Module):
+class Remix(layers.Layer):
     """Remix.
     Mixes different noises with clean speech within a given batch
     """
 
-    def forward(self, sources):
-        noise, clean = sources
-        bs, *other = noise.shape
-        device = noise.device
-        perm = th.argsort(th.rand(bs, device=device), dim=0)
-        return th.stack([noise[perm], clean])
+    def call(self, inputs, grouped=False):
+        if grouped:
+            # Shuffle the respective noise tensors of each group together
+            length = tf.shape(inputs[0])[1]
+            indices = tf.range(0, length)
+            indices = tf.random.shuffle(indices)
+            def remix(sources):
+                noise, clean = sources
+                return tf.stack([tf.gather(noise, indices), clean])
+            return tuple(remix(group) for group in inputs)
+        else:
+            noise, clean = inputs
+            return tf.stack([tf.random.shuffle(noise), clean])
 
-
-class RevEcho(nn.Module):
+class RevEcho(layers.Layer):
     """
     Hacky Reverb but runs on GPU without slowing down training.
     This reverb adds a succession of attenuated echos of the input
@@ -82,27 +86,39 @@ class RevEcho(nn.Module):
         self.keep_clean = keep_clean
         self.sample_rate = sample_rate
 
+    def get_config(self):
+        config = super().get_config()
+        config.update({"proba": self.proba})
+        config.update({"initial": self.initial})
+        config.update({"rt60": self.rt60})
+        config.update({"first_delay": self.first_delay})
+        config.update({"repeat": self.repeat})
+        config.update({"jitter": self.jitter})
+        config.update({"keep_clean": self.keep_clean})
+        config.update({"sample_rate": self.sample_rate})
+        return config
+
     def _reverb(self, source, initial, first_delay, rt60):
         """
         Return the reverb for a single source.
         """
-        length = source.shape[-1]
-        reverb = th.zeros_like(source)
+        length = tf.shape(source)[-2]
+        reverb = tf.zeros_like(source)
         for _ in range(self.repeat):
             frac = 1  # what fraction of the first echo amplitude is still here
             echo = initial * source
             while frac > 1e-3:
                 # First jitter noise for the delay
-                jitter = 1 + self.jitter * random.uniform(-1, 1)
+                jitter = 1 + self.jitter * tf.random.uniform((), -1, 1)
                 delay = min(
                     1 + int(jitter * first_delay * self.sample_rate),
                     length)
                 # Delay the echo in time by padding with zero on the left
-                echo = F.pad(echo[:, :, :-delay], (delay, 0))
+                echo = tf.pad(echo[..., :-delay, :], [[0,0],[delay,0],[0,0]])
                 reverb += echo
 
                 # Second jitter noise for the attenuation
-                jitter = 1 + self.jitter * random.uniform(-1, 1)
+                jitter = 1 + self.jitter * tf.random.uniform((), -1, 1)
                 # we want, with `d` the attenuation, d**(rt60 / first_ms) = 1e-3
                 # i.e. log10(d) = -3 * first_ms / rt60, so that
                 attenuation = 10**(-3 * jitter * first_delay / rt60)
@@ -110,14 +126,14 @@ class RevEcho(nn.Module):
                 frac *= attenuation
         return reverb
 
-    def forward(self, wav):
-        if random.random() >= self.proba:
+    def call(self, wav):
+        if tf.random.uniform(()) >= self.proba:
             return wav
         noise, clean = wav
         # Sample characteristics for the reverb
-        initial = random.random() * self.initial
-        first_delay = random.uniform(*self.first_delay)
-        rt60 = random.uniform(*self.rt60)
+        initial = tf.random.uniform(()) * self.initial
+        first_delay = tf.random.uniform((), *self.first_delay)
+        rt60 = tf.random.uniform((), *self.rt60)
 
         reverb_noise = self._reverb(noise, initial, first_delay, rt60)
         # Reverb for the noise is always added back to the noise
@@ -127,65 +143,78 @@ class RevEcho(nn.Module):
         clean += self.keep_clean * reverb_clean
         noise += (1 - self.keep_clean) * reverb_clean
 
-        return th.stack([noise, clean])
+        return tf.stack([noise, clean])
 
 
-class BandMask(nn.Module):
+class BandMask(layers.Layer):
     """BandMask.
     Maskes bands of frequencies. Similar to Park, Daniel S., et al.
     "Specaugment: A simple data augmentation method for automatic speech recognition."
     (https://arxiv.org/pdf/1904.08779.pdf) but over the waveform.
     """
 
-    def __init__(self, maxwidth=0.2, bands=120, sample_rate=16_000):
+    def __init__(self, maxwidth=0.2, bands=120, sample_rate=16_000, **kwargs):
         """__init__.
 
         :param maxwidth: the maximum width to remove
         :param bands: number of bands
         :param sample_rate: signal sample rate
         """
-        super().__init__()
+        super().__init__(**kwargs)
         self.maxwidth = maxwidth
         self.bands = bands
         self.sample_rate = sample_rate
 
-    def forward(self, wav):
-        bands = self.bands
-        bandwidth = int(abs(self.maxwidth) * bands)
-        mels = dsp.mel_frequencies(bands, 40, self.sample_rate/2) / self.sample_rate
-        low = random.randrange(bands)
-        high = random.randrange(low, min(bands, low + bandwidth))
-        filters = dsp.LowPassFilters([mels[low], mels[high]]).to(wav.device)
+        self.bandwidth = int(abs(maxwidth) * bands)
+        self.mels = dsp.mel_frequencies(bands, 40, sample_rate/2) / sample_rate
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"maxwidth": self.maxwidth})
+        config.update({"bands": self.bands})
+        config.update({"sample_rate": self.sample_rate})
+        return config
+
+    def call(self, wav):
+        low = tf.random.uniform((), maxval=bands, dtype=tf.dtypes.int32)
+        high = tf.random.uniform((), minval=low, maxval=min(self.bands, low + self.bandwidth), dtype=tf.dtypes.int32)
+        filters = dsp.LowPassFilters(tf.gather(self.mels, [low, high]))
         low, midlow = filters(wav)
         # band pass filtering
         out = wav - midlow + low
         return out
 
 
-class Shift(nn.Module):
+class Shift(layers.Layer):
     """Shift."""
 
-    def __init__(self, shift=8192, same=False):
+    def __init__(self, shift=8192, same=False, **kwargs):
         """__init__.
 
         :param shift: randomly shifts the signals up to a given factor
         :param same: shifts both clean and noisy files by the same factor
         """
-        super().__init__()
+        super().__init__(**kwargs)
         self.shift = shift
         self.same = same
 
-    def forward(self, wav):
-        sources, batch, channels, length = wav.shape
+    def get_config(self):
+        config = super().get_config()
+        config.update({"shift": self.shift})
+        config.update({"same": self.same})
+        return config
+
+    def call(self, wav):
+        sources, batch, length, channels = tf.shape(wav)
         length = length - self.shift
         if self.shift > 0:
-            if not self.training:
-                wav = wav[..., :length]
-            else:
-                offsets = th.randint(
-                    self.shift,
-                    [1 if self.same else sources, batch, 1, 1], device=wav.device)
-                offsets = offsets.expand(sources, -1, channels, -1)
-                indexes = th.arange(length, device=wav.device)
-                wav = wav.gather(3, indexes + offsets)
-        return wav
+            offsets = tf.random.uniform(
+                (1 if same else sources, batch),
+                maxval=shift,
+                dtype=tf.dtypes.int32)
+            offsets = tf.tile(offsets, [sources if same else 1,1])
+            indices = tf.range(length) + offsets[...,tf.newaxis]
+            wav = tf.gather(audio, indices, axis=2, batch_dims=2)
+        else:
+            offsets = tf.zeros((sources, batch))
+        return wav, offsets
